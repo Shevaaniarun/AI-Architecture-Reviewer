@@ -1,0 +1,231 @@
+"""Synchronous in-memory orchestration of the deterministic analyzer."""
+from __future__ import annotations
+
+from dataclasses import asdict
+from datetime import UTC, datetime
+from pathlib import Path
+from threading import Lock
+from typing import Any
+
+from app.analyzer.architecture import infer_architecture
+from app.analyzer.detectors import (
+    analyze_performance,
+    analyze_security,
+    analyze_solid,
+    detect_smells,
+    thresholds_from_settings,
+)
+from app.analyzer.graph import build_dependency_graph
+from app.analyzer.llm.review_service import generate_ai_review
+from app.analyzer.metrics import calculate_metrics
+from app.analyzer.parser import PythonAstParser
+from app.core.config import Settings
+from app.services.repository_ingestion import IngestionResult
+
+
+class AnalysisService:
+    """Run parse → metrics → graph → heuristics → inferred architecture."""
+
+    def __init__(self) -> None:
+        self._analyses: dict[str, dict[str, Any]] = {}
+        self._reports: dict[str, str] = {}
+        self._lock = Lock()
+
+    def analyze(
+        self,
+        ingestion: IngestionResult,
+        repository_root: Path,
+        settings: Settings,
+    ) -> dict[str, Any]:
+        parsed_files = PythonAstParser().parse_directory(repository_root)
+        metrics = calculate_metrics(parsed_files)
+        graph = build_dependency_graph(parsed_files)
+        thresholds = thresholds_from_settings(settings)
+        findings = [
+            *detect_smells(parsed_files, metrics, graph, thresholds),
+            *analyze_solid(
+                parsed_files,
+                graph,
+                wide_interface_methods=settings.wide_interface_methods,
+            ),
+            *analyze_security(parsed_files),
+            *analyze_performance(
+                parsed_files,
+                metrics,
+                high_complexity=settings.high_complexity,
+            ),
+        ]
+        findings.sort(key=lambda item: (item.file.casefold(), item.line or 0, item.type))
+        architecture = infer_architecture(graph)
+        finding_results = [
+            {
+                **asdict(finding),
+                "source_snippet": _source_snippet(repository_root, finding.file, finding.line, finding.line_end),
+            }
+            for finding in findings
+        ]
+        parser_errors = [
+            {"file": parsed.filename, "error": parsed.parse_error}
+            for parsed in parsed_files
+            if parsed.parse_error
+        ]
+        result = {
+            "analysis_id": ingestion.ingestion_id,
+            "repository": {
+                "name": ingestion.repository_name,
+                "source": ingestion.source,
+                "status": "COMPLETED",
+                "python_files": len(parsed_files),
+                "files": metrics.files,
+                "warnings": ingestion.warnings,
+            },
+            "metrics": asdict(metrics),
+            "findings": finding_results,
+            "dependency_graph": {
+                "dependency_count": graph.dependency_count,
+                "edges": [asdict(edge) for edge in graph.edges],
+                "fan_in": graph.fan_in,
+                "fan_out": graph.fan_out,
+                "cycles": graph.cycles,
+            },
+            "architecture": asdict(architecture),
+            "parser_errors": parser_errors,
+            "analysis_metadata": {
+                "completed_at": datetime.now(UTC).isoformat(),
+                "code_executed": False,
+                "heuristic_thresholds": {
+                    "long_method_lines": settings.long_method_lines,
+                    "large_class_methods": settings.large_class_methods,
+                    "long_parameter_count": settings.long_parameter_count,
+                    "high_fan_out": settings.high_fan_out,
+                    "high_complexity": settings.high_complexity,
+                    "wide_interface_methods": settings.wide_interface_methods,
+                },
+                "limitations": [
+                    "Static heuristics indicate candidates and do not prove design violations, vulnerabilities, or runtime performance.",
+                    "Dependency edges represent imports resolved to files in this repository only.",
+                    "Architecture components are grouped by top-level directory and are inferred from static imports.",
+                ],
+            },
+        }
+        result["ai_review"] = generate_ai_review(result, settings)
+        report = _render_report(result)
+        with self._lock:
+            self._analyses[ingestion.ingestion_id] = result
+            self._reports[ingestion.ingestion_id] = report
+        return result
+
+    def get_analysis(self, analysis_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            return self._analyses.get(analysis_id)
+
+    def get_findings(self, analysis_id: str) -> list[dict[str, Any]] | None:
+        result = self.get_analysis(analysis_id)
+        return result["findings"] if result else None
+
+    def get_architecture(self, analysis_id: str) -> dict[str, Any] | None:
+        result = self.get_analysis(analysis_id)
+        if result is None:
+            return None
+        return {
+            "status": result["architecture"]["status"],
+            "components": result["architecture"]["components"],
+            "relationships": result["architecture"]["relationships"],
+            "mermaid": result["architecture"]["mermaid"],
+            "dependency_graph": result["dependency_graph"],
+        }
+
+    def get_report(self, analysis_id: str) -> str | None:
+        with self._lock:
+            return self._reports.get(analysis_id)
+
+    def cleanup(self) -> None:
+        with self._lock:
+            self._analyses.clear()
+            self._reports.clear()
+
+
+def _render_report(result: dict[str, Any]) -> str:
+    repository = result["repository"]
+    metrics = result["metrics"]
+    architecture = result["architecture"]
+    lines = [
+        f"# Static Analysis Report: {repository['name']}",
+        "",
+        f"Analysis ID: {result['analysis_id']}",
+        f"Source: {repository['source']}",
+        "",
+        "## Project summary",
+        f"- Python files: {repository['python_files']}",
+        f"- Classes: {metrics['classes']}",
+        f"- Functions: {metrics['functions']}",
+        f"- Methods: {metrics['methods']}",
+        f"- Lines of code: {metrics['lines_of_code']}",
+        f"- Imports: {metrics['imports']}",
+        f"- Local dependencies: {result['dependency_graph']['dependency_count']}",
+        "",
+        "## Findings",
+    ]
+    if result["findings"]:
+        for finding in result["findings"]:
+            location = f"{finding['file']}:{finding['line']}" if finding["line"] else finding["file"]
+            lines.append(f"- **{finding['type']}** ({finding['severity']}) at `{location}` — {finding['message']}")
+            lines.append(f"  Evidence: `{finding['evidence']}`")
+    else:
+        lines.append("- No findings matched the configured heuristic rules.")
+    ai_review = result.get("ai_review", {})
+    lines.extend(["", "## AI review", f"Status: {ai_review.get('status', 'not_configured')}"])
+    if ai_review.get("summary"):
+        lines.append(ai_review["summary"])
+    if ai_review.get("architecture_summary"):
+        lines.extend(["", "Architecture interpretation:", ai_review["architecture_summary"]])
+    ai_finding_reviews = {item["finding_id"]: item for item in ai_review.get("findings", [])}
+    if ai_finding_reviews:
+        lines.extend(["", "Finding explanations:"])
+        for finding_id, explanation in ai_finding_reviews.items():
+            lines.append(f"- **{finding_id}**: {explanation['explanation']}")
+            if explanation["architectural_impact"]:
+                lines.append(f"  Architectural impact: {explanation['architectural_impact']}")
+            if explanation["recommendation"]:
+                lines.append(f"  Recommendation: {explanation['recommendation']}")
+    if ai_review.get("overall_recommendations"):
+        lines.extend(["", "Recommendations:"])
+        lines.extend(f"- {item}" for item in ai_review["overall_recommendations"])
+    lines.extend(
+        [
+            "",
+            "## Inferred architecture",
+            f"Status: {architecture['status']}",
+            "",
+            "```mermaid",
+            architecture["mermaid"],
+            "```",
+            "",
+            "## Limitations",
+            *[f"- {item}" for item in result["analysis_metadata"]["limitations"]],
+            "- Repository code was not executed.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _source_snippet(repository_root: Path, filename: str, line: int | None, line_end: int | None) -> dict[str, Any] | None:
+    if line is None or line < 1:
+        return None
+    candidate = (repository_root / Path(filename)).resolve()
+    if not candidate.is_relative_to(repository_root.resolve()) or not candidate.is_file():
+        return None
+    try:
+        lines = candidate.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    if line > len(lines):
+        return None
+    start = max(1, line - 2)
+    requested_end = line_end if line_end is not None else line + 2
+    end = min(len(lines), max(line + 2, requested_end), start + 19)
+    return {
+        "line_start": start,
+        "line_end": end,
+        "text": "\n".join(f"{index}: {lines[index - 1]}" for index in range(start, end + 1)),
+    }
