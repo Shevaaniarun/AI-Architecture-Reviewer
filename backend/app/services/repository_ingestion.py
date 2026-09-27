@@ -12,12 +12,14 @@ import re
 import stat
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import BinaryIO
 
@@ -165,6 +167,8 @@ class IngestionResult:
     files: int
     python_files: int
     warnings: list[str]
+    archive_size_bytes: int = 0
+    timings: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -191,7 +195,10 @@ class _SafeGitHubRedirectHandler(urllib.request.HTTPRedirectHandler):
             or port not in (None, 443)
         ):
             raise IngestionError("GitHub returned an unsafe archive redirect.", 502)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if parsed.hostname != urllib.parse.urlsplit(req.full_url).hostname:
+            redirected.remove_header("Authorization")
+        return redirected
 
 
 class RepositoryIngestionService:
@@ -201,6 +208,7 @@ class RepositoryIngestionService:
         self._settings = settings
         self._workspaces: dict[str, _Workspace] = {}
         self._lock = threading.Lock()
+        self._github_cache: dict[str, tuple[float, str]] = {}
 
     @property
     def workspace_paths(self) -> dict[str, Path]:
@@ -218,22 +226,42 @@ class RepositoryIngestionService:
 
     def ingest_github(self, repository_url: str) -> IngestionResult:
         owner, repository = self._parse_github_url(repository_url)
+        canonical_url = f"https://github.com/{owner}/{repository}"
+        if self._settings.github_cache_ttl_seconds:
+            cached = self._cached_workspace(canonical_url)
+            if cached is not None:
+                return cached
         temporary_directory = tempfile.TemporaryDirectory(prefix="aar-ingest-")
         workspace = Path(temporary_directory.name)
         archive_path = workspace / "source.zip"
         repository_root = workspace / "repository"
         try:
+            download_started = time.perf_counter()
             archive_size = self._download_archive(owner, repository, archive_path)
+            download_seconds = time.perf_counter() - download_started
+            extraction_started = time.perf_counter()
             warnings = self._extract_archive(archive_path, repository_root)
+            extraction_seconds = time.perf_counter() - extraction_started
             archive_path.unlink(missing_ok=True)
-            return self._register_workspace(
+            result = self._register_workspace(
                 temporary_directory,
                 repository_root,
                 repository,
-                f"https://github.com/{owner}/{repository}",
+                canonical_url,
                 warnings,
                 archive_size,
+                timings={
+                    "archive_download_seconds": download_seconds,
+                    "archive_extraction_seconds": extraction_seconds,
+                },
             )
+            if self._settings.github_cache_ttl_seconds > 0:
+                with self._lock:
+                    self._github_cache[canonical_url.casefold()] = (
+                        time.monotonic() + self._settings.github_cache_ttl_seconds,
+                        result.ingestion_id,
+                    )
+            return result
         except Exception:
             temporary_directory.cleanup()
             raise
@@ -249,8 +277,12 @@ class RepositoryIngestionService:
         archive_path = workspace / "upload.zip"
         repository_root = workspace / "repository"
         try:
+            staging_started = time.perf_counter()
             archive_size = self._copy_bounded(upload, archive_path)
+            staging_seconds = time.perf_counter() - staging_started
+            extraction_started = time.perf_counter()
             warnings = self._extract_archive(archive_path, repository_root)
+            extraction_seconds = time.perf_counter() - extraction_started
             archive_path.unlink(missing_ok=True)
             return self._register_workspace(
                 temporary_directory,
@@ -259,6 +291,10 @@ class RepositoryIngestionService:
                 "zip_upload",
                 warnings,
                 archive_size,
+                timings={
+                    "upload_staging_seconds": staging_seconds,
+                    "archive_extraction_seconds": extraction_seconds,
+                },
             )
         except Exception:
             temporary_directory.cleanup()
@@ -268,6 +304,7 @@ class RepositoryIngestionService:
         """Remove all retained temporary workspaces, usually on app shutdown."""
         with self._lock:
             workspaces, self._workspaces = self._workspaces, {}
+            self._github_cache.clear()
         for workspace in workspaces.values():
             workspace.temporary_directory.cleanup()
 
@@ -279,6 +316,7 @@ class RepositoryIngestionService:
         source: str,
         warnings: list[str],
         archive_size: int,
+        timings: dict[str, float] | None = None,
     ) -> IngestionResult:
         file_paths = [path for path in repository_root.rglob("*") if path.is_file()]
         python_files = sum(path.suffix.lower() == ".py" for path in file_paths)
@@ -293,11 +331,14 @@ class RepositoryIngestionService:
             files=len(file_paths),
             python_files=python_files,
             warnings=warnings[:_MAX_WARNINGS],
+            archive_size_bytes=archive_size,
+            timings=timings or {},
         )
         with self._lock:
             while len(self._workspaces) >= self._settings.max_active_workspaces:
                 oldest_id = next(iter(self._workspaces))
                 oldest = self._workspaces.pop(oldest_id)
+                self._remove_cached_workspace_locked(oldest_id)
                 oldest.temporary_directory.cleanup()
             self._workspaces[result.ingestion_id] = _Workspace(
                 temporary_directory=temporary_directory,
@@ -313,6 +354,25 @@ class RepositoryIngestionService:
             archive_size,
         )
         return result
+
+    def _cached_workspace(self, canonical_url: str) -> IngestionResult | None:
+        key = canonical_url.casefold()
+        with self._lock:
+            cached = self._github_cache.get(key)
+            if cached is None:
+                return None
+            expires_at, ingestion_id = cached
+            workspace = self._workspaces.get(ingestion_id)
+            if expires_at <= time.monotonic() or workspace is None:
+                self._github_cache.pop(key, None)
+                return None
+            logger.info("github_repository_cache_hit id=%s", ingestion_id)
+            return workspace.result
+
+    def _remove_cached_workspace_locked(self, ingestion_id: str) -> None:
+        expired = [key for key, (_, cached_id) in self._github_cache.items() if cached_id == ingestion_id]
+        for key in expired:
+            self._github_cache.pop(key, None)
 
     @staticmethod
     def _parse_github_url(repository_url: str) -> tuple[str, str]:
@@ -357,6 +417,7 @@ class RepositoryIngestionService:
                 "Accept": "application/vnd.github+json",
                 "User-Agent": "AI-Architecture-Reviewer/0.1",
                 "X-GitHub-Api-Version": "2022-11-28",
+                **({"Authorization": f"Bearer {self._settings.github_token}"} if self._settings.github_token else {}),
             },
         )
         opener = urllib.request.build_opener(_SafeGitHubRedirectHandler())
@@ -379,13 +440,51 @@ class RepositoryIngestionService:
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 raise IngestionError("GitHub repository was not found or is not public.", 404) from None
-            if exc.code == 403:
-                raise IngestionError("GitHub denied the archive request; check repository access or rate limits.", 429) from None
+            if exc.code in {403, 429}:
+                raise self._github_access_error(exc) from None
             raise IngestionError(f"GitHub archive request failed with HTTP {exc.code}.", 502) from None
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise IngestionError(f"Could not download the GitHub repository: {exc}", 502) from None
         except ValueError:
             raise IngestionError("GitHub returned an invalid archive size.", 502) from None
+
+    @staticmethod
+    def _github_access_error(error: urllib.error.HTTPError) -> IngestionError:
+        headers = error.headers or {}
+        remaining = headers.get("X-RateLimit-Remaining")
+        retry_after = headers.get("Retry-After")
+        reset_epoch = headers.get("X-RateLimit-Reset")
+        try:
+            error_body = error.read(4096).decode("utf-8", errors="replace").casefold()
+        except (OSError, AttributeError):
+            error_body = ""
+        rate_limited = (
+            error.code == 429
+            or remaining == "0"
+            or bool(retry_after)
+            or "rate limit" in error_body
+            or "secondary rate" in error_body
+        )
+        if rate_limited:
+            retry_message = ""
+            if retry_after:
+                retry_message = f" Retry after approximately {retry_after} seconds."
+            elif reset_epoch:
+                try:
+                    reset_at = datetime.fromtimestamp(int(reset_epoch), UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+                    retry_message = f" Rate limit resets at {reset_at}."
+                except (ValueError, OverflowError, OSError):
+                    retry_message = " Check X-RateLimit-Reset for the reset time."
+            return IngestionError(
+                "GitHub API rate limit reached. Configure GITHUB_TOKEN to use the authenticated rate limit."
+                + retry_message,
+                429,
+            )
+        return IngestionError(
+            "GitHub denied access to this repository (403); it may be private or restricted. "
+            "Only public repositories are supported.",
+            403,
+        )
 
     @property
     def _max_repository_bytes(self) -> int:

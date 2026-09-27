@@ -3,8 +3,11 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import UTC, datetime
+import logging
 from pathlib import Path
 from threading import Lock
+import time
+import tracemalloc
 from typing import Any
 
 from app.analyzer.architecture import infer_architecture
@@ -16,11 +19,14 @@ from app.analyzer.detectors import (
     thresholds_from_settings,
 )
 from app.analyzer.graph import build_dependency_graph
-from app.analyzer.llm.review_service import generate_ai_review
+from app.analyzer.llm.review_service import ai_review_initial_state, generate_ai_review, generate_architecture_image
 from app.analyzer.metrics import calculate_metrics
 from app.analyzer.parser import PythonAstParser
 from app.core.config import Settings
 from app.services.repository_ingestion import IngestionResult
+
+logger = logging.getLogger(__name__)
+_PROFILE_LOCK = Lock()
 
 
 class AnalysisService:
@@ -37,10 +43,52 @@ class AnalysisService:
         repository_root: Path,
         settings: Settings,
     ) -> dict[str, Any]:
+        # tracemalloc is process-global; serialize only this measurement window.
+        with _PROFILE_LOCK:
+            was_tracing = tracemalloc.is_tracing()
+            if not was_tracing:
+                tracemalloc.start()
+            started = time.perf_counter()
+            try:
+                result = self._analyze(ingestion, repository_root, settings)
+                elapsed = time.perf_counter() - started
+                _, peak_bytes = tracemalloc.get_traced_memory()
+            finally:
+                if not was_tracing:
+                    tracemalloc.stop()
+        performance = result["performance"]
+        performance["timings"]["total_static_analysis_seconds"] = elapsed
+        performance["throughput"] = _throughput(result, elapsed)
+        performance["python_heap_peak_mb"] = round(peak_bytes / (1024 * 1024), 2)
+        performance["memory_measurement"] = (
+            "tracemalloc peak of Python allocations; tracing was already active before this analysis"
+            if was_tracing
+            else "tracemalloc peak during this static analysis of Python allocations; not process RSS"
+        )
+        self._print_performance(ingestion, result)
+        with self._lock:
+            self._analyses[ingestion.ingestion_id] = result
+            self._reports[ingestion.ingestion_id] = _render_report(result)
+        return result
+
+    def _analyze(
+        self,
+        ingestion: IngestionResult,
+        repository_root: Path,
+        settings: Settings,
+    ) -> dict[str, Any]:
+        timings: dict[str, float] = {}
+        stage_started = time.perf_counter()
         parsed_files = PythonAstParser().parse_directory(repository_root)
+        timings["ast_parsing_seconds"] = time.perf_counter() - stage_started
+        stage_started = time.perf_counter()
         metrics = calculate_metrics(parsed_files)
+        timings["metric_calculation_seconds"] = time.perf_counter() - stage_started
+        stage_started = time.perf_counter()
         graph = build_dependency_graph(parsed_files)
+        timings["dependency_graph_seconds"] = time.perf_counter() - stage_started
         thresholds = thresholds_from_settings(settings)
+        stage_started = time.perf_counter()
         findings = [
             *detect_smells(parsed_files, metrics, graph, thresholds),
             *analyze_solid(
@@ -56,10 +104,14 @@ class AnalysisService:
             ),
         ]
         findings.sort(key=lambda item: (item.file.casefold(), item.line or 0, item.type))
+        timings["finding_detection_seconds"] = time.perf_counter() - stage_started
+        stage_started = time.perf_counter()
         architecture = infer_architecture(graph)
+        timings["architecture_recovery_seconds"] = time.perf_counter() - stage_started
         finding_results = [
             {
                 **asdict(finding),
+                "category": finding.category,
                 "source_snippet": _source_snippet(repository_root, finding.file, finding.line, finding.line_end),
             }
             for finding in findings
@@ -107,13 +159,78 @@ class AnalysisService:
                     "Architecture components are grouped by top-level directory and are inferred from static imports.",
                 ],
             },
+            "performance": {
+                "timings": {**ingestion.timings, **timings},
+                "throughput": {},
+                "python_heap_peak_mb": None,
+                "memory_measurement": "tracemalloc peak of Python allocations; not process RSS",
+            },
         }
-        result["ai_review"] = generate_ai_review(result, settings)
-        report = _render_report(result)
-        with self._lock:
-            self._analyses[ingestion.ingestion_id] = result
-            self._reports[ingestion.ingestion_id] = report
+        result["ai_review"] = ai_review_initial_state(settings)
         return result
+
+    @staticmethod
+    def _print_performance(ingestion: IngestionResult, result: dict[str, Any]) -> None:
+        metrics = result["metrics"]
+        dependencies = result["dependency_graph"]["dependency_count"]
+        findings = result["findings"]
+        perf = result["performance"]
+        timings = perf["timings"]
+        throughput = perf["throughput"]
+        rows = [
+            "",
+            "=" * 58,
+            "AI ARCHITECTURE REVIEWER — PERFORMANCE",
+            "=" * 58,
+            f"Repository: {ingestion.repository_name}",
+            f"Archive bytes: {ingestion.archive_size_bytes:,}",
+            f"Python files: {metrics['files']:,} | LOC: {metrics['lines_of_code']:,} | Classes: {metrics['classes']:,}",
+            f"Functions: {metrics['functions']:,} | Methods: {metrics['methods']:,} | Dependencies: {dependencies:,} | Findings: {len(findings):,}",
+            "-" * 58,
+            "TIMING (seconds)",
+        ]
+        for key in (
+            "archive_download_seconds", "upload_staging_seconds", "archive_extraction_seconds",
+            "ast_parsing_seconds", "metric_calculation_seconds", "dependency_graph_seconds",
+            "finding_detection_seconds", "architecture_recovery_seconds", "total_static_analysis_seconds",
+        ):
+            if key in timings:
+                rows.append(f"{key.replace('_seconds', '').replace('_', ' ').title()}: {timings[key]:.3f}")
+        rows.extend(
+            [
+                "-" * 58,
+                "THROUGHPUT",
+                f"Python files/sec: {throughput['python_files_per_second']:.2f} | LOC/sec: {throughput['lines_of_code_per_second']:.2f} | Findings/sec: {throughput['findings_per_second']:.2f}",
+                f"Python traced heap peak: {perf['python_heap_peak_mb']:.2f} MB (not process RSS)",
+                f"Gemini configured: {'YES' if result['ai_review']['status'] not in {'not_configured', 'disabled'} else 'NO'}",
+                f"Gemini review time: {result['ai_review'].get('duration_seconds', 0.0):.3f}s | tokens in/out: {result['ai_review'].get('input_tokens')}/{result['ai_review'].get('output_tokens')}",
+                "=" * 58,
+                "",
+            ]
+        )
+        print("\n".join(rows), flush=True)
+
+    def trigger_ai_review(self, analysis_id: str, settings: Settings) -> dict[str, Any] | None:
+        """Run Gemini only on explicit request, then update the in-memory result/report."""
+        with self._lock:
+            analysis = self._analyses.get(analysis_id)
+        if analysis is None:
+            return None
+        review = generate_ai_review(analysis, settings)
+        with self._lock:
+            current = self._analyses.get(analysis_id)
+            if current is None:
+                return None
+            current["ai_review"] = review
+            self._reports[analysis_id] = _render_report(current)
+            return review
+
+    def generate_architecture_image(self, analysis_id: str, settings: Settings) -> dict[str, Any] | None:
+        with self._lock:
+            analysis = self._analyses.get(analysis_id)
+        if analysis is None:
+            return None
+        return generate_architecture_image(analysis, settings)
 
     def get_analysis(self, analysis_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -228,4 +345,14 @@ def _source_snippet(repository_root: Path, filename: str, line: int | None, line
         "line_start": start,
         "line_end": end,
         "text": "\n".join(f"{index}: {lines[index - 1]}" for index in range(start, end + 1)),
+    }
+
+
+def _throughput(result: dict[str, Any], elapsed_seconds: float) -> dict[str, float]:
+    duration = max(elapsed_seconds, 1e-9)
+    metrics = result["metrics"]
+    return {
+        "python_files_per_second": round(metrics["files"] / duration, 2),
+        "lines_of_code_per_second": round(metrics["lines_of_code"] / duration, 2),
+        "findings_per_second": round(len(result["findings"]) / duration, 2),
     }

@@ -31,9 +31,9 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     logger.info(
-        "startup app_env=%s llm_provider=%s ai_enabled=%s",
+        "startup app_env=%s gemini_configured=%s ai_enabled=%s",
         settings.app_env,
-        settings.llm_provider,
+        bool(settings.gemini_api_key),
         settings.enable_ai_analysis,
     )
     try:

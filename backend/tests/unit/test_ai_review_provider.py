@@ -1,58 +1,117 @@
-import json
-
-from app.analyzer.llm.review_service import OpenAIReviewProvider
+from app.analyzer.llm.review_service import GeminiReviewProvider
 
 
-class FakeResponse:
-    headers = {}
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_args):
-        return None
-
-    def read(self):
-        return json.dumps({"choices": [{"message": {"content": "{\"summary\":\"ok\"}"}}]}).encode()
-
-
-def test_openai_provider_sends_prompt_and_parses_chat_completion(monkeypatch):
-    import urllib.request
+def test_gemini_provider_uses_google_sdk_and_schema(monkeypatch):
+    from google import genai
 
     captured = {}
 
-    def fake_urlopen(request, timeout):
-        captured["request"] = request
-        captured["timeout"] = timeout
-        return FakeResponse()
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            captured.update(kwargs)
+            return type(
+                "Response",
+                (),
+                {
+                    "text": '{"summary":"ok","architecture_assessment":"inferred","major_concerns":[],"refactoring_recommendations":[],"false_positive_candidates":[]}',
+                    "usage_metadata": type("Usage", (), {"prompt_token_count": 12, "candidates_token_count": 8})(),
+                },
+            )()
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    provider = OpenAIReviewProvider("test-key", "test-model", timeout_seconds=7)
-    content = provider.complete({"metrics": {"files": 1}})
+    class FakeClient:
+        def __init__(self, *, api_key):
+            captured["api_key"] = api_key
+            self.models = FakeModels()
 
-    request = captured["request"]
-    body = json.loads(request.data)
-    assert request.full_url == OpenAIReviewProvider.endpoint
-    assert request.get_header("Authorization") == "Bearer test-key"
-    assert body["model"] == "test-model"
-    assert body["response_format"] == {"type": "json_object"}
-    assert '"files":1' in body["messages"][1]["content"]
-    assert captured["timeout"] == 7
-    assert content == '{"summary":"ok"}'
+    monkeypatch.setattr(genai, "Client", FakeClient)
+    provider = GeminiReviewProvider("secret-key-test", "gemini-test")
+    review, tokens = provider.review({
+        "repository": {"repository_url": "https://github.com/pallets/flask"},
+        "metrics": {"files": 1},
+    })
+
+    assert captured["api_key"] == "secret-key-test"
+    assert captured["model"] == "gemini-test"
+    assert "metrics" in captured["contents"]
+    assert "https://github.com/pallets/flask" in captured["contents"]
+    assert captured["config"].tools
+    assert captured["config"].response_mime_type == "application/json"
+    assert review.summary == "ok"
+    assert tokens == {"input": 12, "output": 8}
 
 
-def test_openai_provider_rejects_non_text_message_content(monkeypatch):
-    import urllib.request
+def test_gemini_provider_rejects_malformed_structured_response(monkeypatch):
+    from google import genai
 
-    class InvalidContentResponse(FakeResponse):
-        def read(self):
-            return json.dumps({"choices": [{"message": {"content": None}}]}).encode()
+    class FakeClient:
+        def __init__(self, *, api_key):
+            self.models = type(
+                "Models",
+                (),
+                {"generate_content": lambda *_args, **_kwargs: type("Response", (), {"text": "not json", "usage_metadata": None})()},
+            )()
 
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *_args, **_kwargs: InvalidContentResponse())
+    monkeypatch.setattr(genai, "Client", FakeClient)
+    provider = GeminiReviewProvider("secret-key-test", "gemini-test")
 
     try:
-        OpenAIReviewProvider("test-key", "test-model").complete({})
-    except RuntimeError as error:
-        assert "unexpected response shape" in str(error)
+        provider.review({})
+    except ValueError as error:
+        assert "malformed" in str(error)
+        assert "secret-key-test" not in str(error)
     else:
-        raise AssertionError("Non-text provider message should be rejected")
+        raise AssertionError("Malformed Gemini JSON should be rejected")
+
+
+def test_gemini_provider_uses_sdk_parsed_response_when_text_is_empty(monkeypatch):
+    from google import genai
+
+    class FakeClient:
+        def __init__(self, *, api_key):
+            self.models = type(
+                "Models",
+                (),
+                {
+                    "generate_content": lambda *_args, **_kwargs: type(
+                        "Response",
+                        (),
+                        {
+                            "text": None,
+                            "parsed": {
+                                "summary": "Readable review",
+                                "architecture_assessment": "Small project",
+                                "major_concerns": [],
+                                "refactoring_recommendations": [],
+                                "false_positive_candidates": [],
+                            },
+                            "usage_metadata": None,
+                        },
+                    )(),
+                },
+            )()
+
+    monkeypatch.setattr(genai, "Client", FakeClient)
+    review, _ = GeminiReviewProvider("secret-key-test", "gemini-test").review({})
+
+    assert review.summary == "Readable review"
+
+
+def test_gemini_provider_prefers_complete_json_over_incomplete_sdk_parsed_value(monkeypatch):
+    from google import genai
+
+    raw = '{"summary":"Complete text result","architecture_assessment":"Repository summary","major_concerns":[],"refactoring_recommendations":[],"false_positive_candidates":[]}'
+
+    class FakeClient:
+        def __init__(self, *, api_key):
+            self.models = type(
+                "Models",
+                (),
+                {"generate_content": lambda *_args, **_kwargs: type(
+                    "Response", (), {"text": raw, "parsed": {"summary": "Incomplete"}, "usage_metadata": None}
+                )()},
+            )()
+
+    monkeypatch.setattr(genai, "Client", FakeClient)
+    review, _ = GeminiReviewProvider("secret-key-test", "gemini-test").review({})
+
+    assert review.summary == "Complete text result"

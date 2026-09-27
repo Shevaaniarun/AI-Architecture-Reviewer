@@ -17,6 +17,11 @@ class SmellThresholds:
     large_class_methods: int = 15
     long_parameter_count: int = 5
     high_fan_out: int = 10
+    god_class_methods: int = 20
+    god_class_loc: int = 500
+    god_class_fan_out: int = 10
+    god_class_attributes: int = 15
+    god_class_min_signals: int = 3
 
 
 @dataclass(frozen=True)
@@ -36,6 +41,11 @@ class Finding:
     confidence: float | None = None
     requires_validation: bool = False
 
+    @property
+    def category(self) -> str:
+        """UI distinction between direct rules and heuristic candidates."""
+        return "deterministic" if self.status == "detected" else "heuristic/potential"
+
 
 def thresholds_from_settings(settings: Any) -> SmellThresholds:
     """Create detector thresholds from application settings without global state."""
@@ -44,6 +54,11 @@ def thresholds_from_settings(settings: Any) -> SmellThresholds:
         large_class_methods=settings.large_class_methods,
         long_parameter_count=settings.long_parameter_count,
         high_fan_out=settings.high_fan_out,
+        god_class_methods=settings.god_class_methods,
+        god_class_loc=settings.god_class_loc,
+        god_class_fan_out=settings.god_class_fan_out,
+        god_class_attributes=settings.god_class_attributes,
+        god_class_min_signals=settings.god_class_min_signals,
     )
 
 
@@ -115,6 +130,57 @@ def detect_smells(
                             "threshold": limits.large_class_methods,
                         },
                         message="Class exceeds the configured method-count threshold.",
+                    )
+                )
+
+            class_loc = max(1, class_info.line_end - class_info.line_start + 1)
+            collaborators = {
+                call.split(".")[1]
+                for method in class_info.methods
+                for call in method.calls
+                if call.startswith("self.") and len(call.split(".")) >= 3
+            }
+            class_fan_out = len(collaborators)
+            signals = {
+                "method_count": method_count >= limits.god_class_methods,
+                "loc": class_loc >= limits.god_class_loc,
+                "attribute_count": len(class_info.attributes) >= limits.god_class_attributes,
+                "fan_out": class_fan_out >= limits.god_class_fan_out,
+            }
+            met_signals = [name for name, met in signals.items() if met]
+            if len(met_signals) >= limits.god_class_min_signals:
+                findings.append(
+                    Finding(
+                        id=_finding_id("GOD-CLASS-CANDIDATE", parsed.filename, class_info.qualified_name, class_info.line_start),
+                        type="Potential God Class",
+                        file=parsed.filename,
+                        line=class_info.line_start,
+                        line_end=class_info.line_end,
+                        severity="high" if len(met_signals) == 4 else "medium",
+                        evidence={
+                            "class": class_info.qualified_name,
+                            "loc": class_loc,
+                            "method_count": method_count,
+                            "attribute_count": len(class_info.attributes),
+                            "attributes": class_info.attributes,
+                            "collaborators": sorted(collaborators),
+                            "fan_in": dependencies.fan_in.get(parsed.filename, 0),
+                            "fan_out": class_fan_out,
+                            "coupling": class_fan_out,
+                            "signals_met": met_signals,
+                            "signal_thresholds": {
+                                "methods": limits.god_class_methods,
+                                "loc": limits.god_class_loc,
+                                "attributes": limits.god_class_attributes,
+                                "fan_out": limits.god_class_fan_out,
+                                "minimum_signals": limits.god_class_min_signals,
+                            },
+                        },
+                        message="Potential God Class: the class exceeds multiple size/coupling thresholds; the rule is a heuristic, not a design verdict.",
+                        detector="multi_signal_god_class_heuristic",
+                        status="potential",
+                        confidence=0.62 if len(met_signals) == 3 else 0.75,
+                        requires_validation=True,
                     )
                 )
 

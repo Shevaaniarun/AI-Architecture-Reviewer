@@ -8,7 +8,7 @@ without ever executing its code, reconstructs a candidate architecture, detects
 code smells / SOLID heuristic violations / design-pattern candidates / potential
 security and performance issues, builds structured evidence, sends only that
 evidence to an LLM for contextual interpretation, validates the AI output against
-the deterministic evidence, and presents the full review through a web dashboard.
+the deterministic evidence, and presents the full review through a web dashboard. Gemini can also generate an architecture illustration from the inferred component graph when requested.
 
 **Deterministic analysis is authoritative. The LLM explains and prioritizes; it
 never invents facts, and if it contradicts the deterministic evidence, the
@@ -93,15 +93,14 @@ npm install
 cp .env.example .env
 ```
 
-All defaults are safe: no API key is required to run the app
-(`LLM_PROVIDER=mock`).
-Set `CORS_ORIGINS` as a JSON array for any frontend origin other than the
-default `http://localhost:5173`.
-
-To enable AI explanations, set `LLM_PROVIDER=openai`, `LLM_API_KEY`, and
-`LLM_MODEL`. AI receives compact analysis evidence and selected source excerpts
-only; it does not perform or alter deterministic detection. Provider/network
-failures leave the static result available.
+AI is optional. To enable Gemini explanations and architecture image
+generation, set `GEMINI_API_KEY` in the repository-level `.env` file.
+`GEMINI_MODEL` selects the review model; `GEMINI_IMAGE_MODEL` selects the image
+model. The backend reads this same root `.env` whether started from the project
+root, `backend/`, or Docker. Reviews send compact analysis evidence and selected
+source excerpts. For a public GitHub repository, Gemini also receives its URL
+and can inspect that page with URL Context; uploaded ZIP reviews do not fetch
+external pages. Repository code is never executed.
 
 ## Running the backend
 
@@ -166,6 +165,8 @@ Analysis endpoints:
 - `GET /api/analysis/{analysis_id}/findings/{finding_id}`
 - `GET /api/analysis/{analysis_id}/architecture`
 - `GET /api/analysis/{analysis_id}/ai-review`
+- `POST /api/analysis/{analysis_id}/ai-review` to trigger a Gemini review
+- `POST /api/analysis/{analysis_id}/architecture-image` to generate a Gemini image
 - `GET /api/analysis/{analysis_id}/report` for a downloadable Markdown report
 
 POST endpoints run static analysis synchronously and return HTTP 200 with the

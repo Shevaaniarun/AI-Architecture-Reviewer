@@ -4,7 +4,6 @@ export interface HealthResponse {
   app_version: string;
   app_env: string;
   ai_analysis_enabled: boolean;
-  llm_provider: string;
 }
 
 export interface IngestionResponse {
@@ -51,6 +50,9 @@ export interface AiReview {
   overall_recommendations: string[];
   raw_text: string | null;
   message: string;
+  major_concerns?: Array<Record<string, unknown>>;
+  refactoring_recommendations?: Array<Record<string, unknown>>;
+  false_positive_candidates?: Array<Record<string, unknown>>;
 }
 
 export interface AnalysisResult {
@@ -94,6 +96,7 @@ export interface AnalysisResult {
     components: Array<{ name: string; files: string[] }>;
     relationships: Array<{ source: string; target: string; file_dependency_count: number }>;
     mermaid: string;
+    svg: string;
   };
   parser_errors: Array<{ file: string; error: string }>;
   analysis_metadata: {
@@ -145,3 +148,10 @@ export async function getAnalysis(analysisId: string): Promise<AnalysisResult> {
   if (!response.ok) throw new Error(await errorMessage(response));
   return response.json();
 }
+
+export async function triggerAiReview(analysisId: string): Promise<AiReview> {
+  const response = await fetch(`/api/analysis/${encodeURIComponent(analysisId)}/ai-review`, { method: "POST" });
+  if (!response.ok) throw new Error(await errorMessage(response));
+  return response.json();
+}
+

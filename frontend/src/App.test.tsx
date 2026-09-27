@@ -79,7 +79,7 @@ const analysisResponse = {
     architecture_summary: "",
     overall_recommendations: [],
     raw_text: null,
-    message: "Set LLM_PROVIDER=openai to enable AI explanations.",
+    message: "AI review is not configured. Set GEMINI_API_KEY in the backend environment.",
   },
 };
 
@@ -121,6 +121,25 @@ describe("repository analysis dashboard", () => {
       if (url === "/api/analysis/ING-test") {
         return { ok: true, json: async () => analysisResponse };
       }
+      if (url === "/api/analysis/ING-test/ai-review") {
+        return {
+          ok: true,
+          json: async () => ({
+            status: "completed",
+            summary: "Gemini reviewed the repository and its static analysis.",
+            architecture_summary: "The API component depends on the service component.",
+            findings: [{
+              finding_id: "LONG-METHOD:api.py:Controller.process:4",
+              explanation: "This method carries more work than its name suggests; consider its distinct phases.",
+              architectural_impact: "Changes to separate responsibilities may become coupled.",
+              recommendation: "Extract cohesive operations behind focused helpers.",
+            }],
+            overall_recommendations: ["Keep controller coordination separate from service logic."],
+            raw_text: null,
+            message: "Gemini interpretation of the repository and selected analysis evidence.",
+          }),
+        };
+      }
       throw new Error(`Unexpected API call: ${url}`);
     });
 
@@ -149,7 +168,11 @@ describe("repository analysis dashboard", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /AI review/ }));
     expect(await screen.findByText(/AI interpretation is not available|Deterministic review remains available/)).toBeInTheDocument();
-    expect(screen.getByText(/Set LLM_PROVIDER=openai/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Run AI review" }));
+    expect(await screen.findByRole("heading", { name: "Gemini reviewed the repository and its static analysis." })).toBeInTheDocument();
+    expect(screen.getByText(/This method carries more work than its name suggests/)).toBeInTheDocument();
+    expect(screen.getByText(/Keep controller coordination separate/)).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith("/api/analysis/ING-test/ai-review", { method: "POST" });
   });
 
   it("shows a clear error when backend health is unavailable", async () => {
@@ -159,6 +182,61 @@ describe("repository analysis dashboard", () => {
 
     expect(await screen.findByText("API unavailable")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Analyze repository/ })).toBeDisabled();
+  });
+
+  it("sends a GitHub repository analysis to Gemini and renders its explanation", async () => {
+    const githubUrl = "https://github.com/pallets/flask";
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/health") return { ok: true, json: async () => healthyResponse };
+      if (url === "/api/analyze/github") {
+        expect(JSON.parse(String(init?.body))).toEqual({ url: githubUrl });
+        return { ok: true, json: async () => ({ analysis_id: "ING-flask" }) };
+      }
+      if (url === "/api/analysis/ING-flask") {
+        return {
+          ok: true,
+          json: async () => ({
+            ...analysisResponse,
+            analysis_id: "ING-flask",
+            repository: { ...analysisResponse.repository, name: "flask", source: githubUrl },
+          }),
+        };
+      }
+      if (url === "/api/analysis/ING-flask/ai-review") {
+        return {
+          ok: true,
+          json: async () => ({
+            status: "completed",
+            summary: "Flask uses a compact application core with extension points.",
+            findings: [{
+              finding_id: "LONG-METHOD:api.py:Controller.process:4",
+              explanation: "This signal is limited; the repository context shows the method coordinates focused work.",
+              architectural_impact: "No additional coupling is evidenced here.",
+              recommendation: "Keep the current operation grouped unless it grows further.",
+            }],
+            architecture_summary: "A compact core provides extension points for surrounding integrations.",
+            overall_recommendations: ["Keep extension boundaries explicit."],
+            raw_text: null,
+            message: "Gemini reviewed the public repository URL and analysis evidence.",
+          }),
+        };
+      }
+      throw new Error(`Unexpected API call: ${url}`);
+    });
+
+    render(<App />);
+    await screen.findByText("API connected");
+    fireEvent.click(screen.getByRole("tab", { name: "GitHub URL" }));
+    fireEvent.change(screen.getByLabelText(/PUBLIC REPOSITORY URL/), { target: { value: githubUrl } });
+    fireEvent.click(screen.getByRole("button", { name: /Analyze repository/ }));
+    expect(await screen.findByRole("heading", { name: "flask" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "AI review" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Run AI review" }));
+
+    expect(await screen.findByRole("heading", { name: "Flask uses a compact application core with extension points." })).toBeInTheDocument();
+    expect(screen.getByText(/repository context shows the method coordinates focused work/)).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith("/api/analysis/ING-flask/ai-review", { method: "POST" });
   });
 
   it("displays API validation errors beside the upload form", async () => {

@@ -3,8 +3,10 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import PlainTextResponse
+from starlette.concurrency import run_in_threadpool
 
 from app.api.ingestion import get_analysis_service
+from app.core.config import get_settings
 
 router = APIRouter(prefix="/api/analysis", tags=["analysis-results"])
 
@@ -56,6 +58,30 @@ def get_analysis_ai_review(analysis_id: str) -> dict:
     return result["ai_review"]
 
 
+@router.post("/{analysis_id}/ai-review")
+async def trigger_analysis_ai_review(analysis_id: str) -> dict:
+    review = await run_in_threadpool(
+        get_analysis_service().trigger_ai_review,
+        analysis_id,
+        get_settings(),
+    )
+    if review is None:
+        raise _not_found(analysis_id)
+    return review
+
+
+@router.post("/{analysis_id}/architecture-image")
+async def generate_analysis_architecture_image(analysis_id: str) -> dict:
+    image = await run_in_threadpool(
+        get_analysis_service().generate_architecture_image,
+        analysis_id,
+        get_settings(),
+    )
+    if image is None:
+        raise _not_found(analysis_id)
+    return image
+
+
 @router.get("/{analysis_id}/findings")
 def get_analysis_findings(analysis_id: str) -> dict:
     findings = get_analysis_service().get_findings(analysis_id)
@@ -97,6 +123,14 @@ def get_analysis_architecture(analysis_id: str) -> dict:
     if architecture is None:
         raise _not_found(analysis_id)
     return architecture
+
+
+@router.get("/{analysis_id}/architecture.svg", response_class=PlainTextResponse)
+def get_analysis_architecture_svg(analysis_id: str) -> PlainTextResponse:
+    result = get_analysis_service().get_analysis(analysis_id)
+    if result is None:
+        raise _not_found(analysis_id)
+    return PlainTextResponse(result["architecture"]["svg"], media_type="image/svg+xml")
 
 
 @router.get("/{analysis_id}/report", response_class=PlainTextResponse)

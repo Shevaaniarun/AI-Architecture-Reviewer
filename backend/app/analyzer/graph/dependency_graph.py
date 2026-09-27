@@ -112,6 +112,17 @@ def _resolve_import(
     if not relative_package_only and target_base in module_to_file:
         return module_to_file[target_base]
 
+    # A repository archive can contain a package root directory (for example
+    # `app/`) while parsed filenames are relative to that root (`api/x.py`).
+    # Resolve a prefixed absolute import only when the suffix match is unique.
+    suffix_matches = [
+        filename
+        for module_name, filename in module_to_file.items()
+        if target_base and module_name.endswith(f".{target_base}")
+    ]
+    if len(suffix_matches) == 1:
+        return suffix_matches[0]
+
     # `from package import module` can name a sibling module rather than a symbol.
     for name in imported_names:
         if name == "*" or "." in name:
@@ -119,6 +130,13 @@ def _resolve_import(
         candidate = f"{target_base}.{name}" if target_base else name
         if candidate in module_to_file:
             return module_to_file[candidate]
+        suffix_candidates = [
+            filename
+            for module_name, filename in module_to_file.items()
+            if candidate and module_name.endswith(f".{candidate}")
+        ]
+        if len(suffix_candidates) == 1:
+            return suffix_candidates[0]
     if target_base in module_to_file:
         return module_to_file[target_base]
     return None

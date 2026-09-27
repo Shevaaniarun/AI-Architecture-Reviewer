@@ -95,6 +95,50 @@ def test_can_create_smell_thresholds_from_application_settings():
         large_class_methods=7,
         long_parameter_count=4,
         high_fan_out=6,
+        god_class_methods=22,
     )
 
-    assert thresholds_from_settings(settings) == SmellThresholds(12, 7, 4, 6)
+    assert thresholds_from_settings(settings) == SmellThresholds(12, 7, 4, 6, 22, 500, 10, 15, 3)
+
+
+def test_detects_potential_god_class_only_when_multiple_signals_are_met():
+    many_methods = "\n".join(
+        f"    def operation_{index}(self):\n        return self.store_{index}.save(index)"
+        for index in range(4)
+    )
+    god_source = "class God:\n" + "\n".join(
+        f"    field_{index} = {index}" for index in range(4)
+    ) + "\n" + many_methods + "\n"
+    normal_source = "class Normal:\n    def run(self):\n        return True\n"
+    files = [parse("god.py", god_source), parse("normal.py", normal_source)]
+    thresholds = SmellThresholds(
+        large_class_methods=10,
+        god_class_methods=3,
+        god_class_loc=8,
+        god_class_fan_out=3,
+        god_class_attributes=3,
+        god_class_min_signals=3,
+    )
+
+    findings = detect_smells(files, calculate_metrics(files), build_dependency_graph(files), thresholds)
+    candidates = [finding for finding in findings if finding.type == "Potential God Class"]
+
+    assert len(candidates) == 1
+    assert candidates[0].file == "god.py"
+    assert candidates[0].category == "heuristic/potential"
+    assert candidates[0].requires_validation is True
+    assert candidates[0].evidence["attribute_count"] == 4
+    assert candidates[0].evidence["collaborators"] == ["store_0", "store_1", "store_2", "store_3"]
+    assert len(candidates[0].evidence["signals_met"]) >= 3
+
+
+def test_large_class_and_potential_god_class_are_distinct_findings():
+    source = "class Broad:\n" + "\n".join(
+        f"    def method_{index}(self):\n        return {index}" for index in range(3)
+    ) + "\n"
+    files = [parse("broad.py", source)]
+    thresholds = SmellThresholds(large_class_methods=2, god_class_methods=50, god_class_loc=500, god_class_attributes=50, god_class_fan_out=10)
+
+    findings = detect_smells(files, calculate_metrics(files), build_dependency_graph(files), thresholds)
+
+    assert [finding.type for finding in findings] == ["Large Class"]

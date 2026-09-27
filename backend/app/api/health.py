@@ -21,7 +21,6 @@ class HealthResponse(BaseModel):
     app_version: str
     app_env: str
     ai_analysis_enabled: bool
-    llm_provider: str
 
 
 @router.get("/api/health", response_model=HealthResponse)
@@ -33,5 +32,4 @@ def health() -> HealthResponse:
         app_version=settings.app_version,
         app_env=settings.app_env,
         ai_analysis_enabled=settings.enable_ai_analysis,
-        llm_provider=settings.llm_provider,
     )

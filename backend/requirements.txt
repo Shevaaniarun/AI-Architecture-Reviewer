@@ -12,6 +12,7 @@ libcst>=1.4
 radon>=6.0
 bandit>=1.7
 networkx>=3.3
+google-genai>=1.0,<2.0
 
 # --- Repository ingestion ---
 # GitHub archives are retrieved over HTTPS without invoking Git or repository tooling.

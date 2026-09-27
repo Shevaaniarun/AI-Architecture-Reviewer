@@ -57,12 +57,14 @@ async def ingest_github_repository(
         workspace, metadata = service.get_workspace(result.ingestion_id)
         if workspace is None:
             raise HTTPException(status_code=500, detail="Ingested repository workspace is unavailable.")
-        analysis = await run_in_threadpool(
-            get_analysis_service().analyze,
-            metadata,
-            workspace,
-            get_settings(),
-        )
+        analysis = get_analysis_service().get_analysis(result.ingestion_id)
+        if analysis is None:
+            analysis = await run_in_threadpool(
+                get_analysis_service().analyze,
+                metadata,
+                workspace,
+                get_settings(),
+            )
     except IngestionError as error:
         _raise_http_error(error)
     except RuntimeError as error:

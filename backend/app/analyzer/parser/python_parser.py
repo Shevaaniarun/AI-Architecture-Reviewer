@@ -74,6 +74,7 @@ class ClassInfo:
     line_end: int
     base_classes: list[str] = field(default_factory=list)
     methods: list[FunctionInfo] = field(default_factory=list)
+    attributes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -241,12 +242,38 @@ class _StructureCollector(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
+        self._record_class_attributes(node.targets)
         self._record_credential_assignment(node.targets, node.value, node.lineno)
         self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self._record_class_attributes([node.target])
         self._record_credential_assignment([node.target], node.value, node.lineno)
         self.generic_visit(node)
+
+    def _record_class_attributes(self, targets: list[ast.expr]) -> None:
+        if not self.class_stack:
+            return
+        class_depth = self.class_function_depths[-1]
+        in_class_body = len(self.function_stack) == class_depth
+        in_init = bool(self.function_stack) and self.function_stack[-1].name == "__init__"
+        if not in_class_body and not in_init:
+            return
+        for target in targets:
+            for node in ast.walk(target):
+                if in_class_body and isinstance(node, ast.Name) and not node.id.startswith("_"):
+                    name = node.id
+                elif (
+                    in_init
+                    and isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id in {"self", "cls"}
+                ):
+                    name = node.attr
+                else:
+                    continue
+                if name not in self.class_stack[-1].attributes:
+                    self.class_stack[-1].attributes.append(name)
 
     def _record_credential_assignment(
         self,

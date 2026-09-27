@@ -24,6 +24,7 @@ import {
   analyzeGitHubRepository,
   getAnalysis,
   getHealth,
+  triggerAiReview,
   uploadRepository,
   type AnalysisResult,
   type Finding,
@@ -108,6 +109,7 @@ export default function App() {
     return (
       <Dashboard
         analysis={analysis}
+        onAnalysisUpdate={(update) => setAnalysis((current) => current ? { ...current, ...update } : current)}
         section={section}
         setSection={setSection}
         onBack={() => { setAnalysis(null); setSelectedFinding(null); setError(null); }}
@@ -194,6 +196,7 @@ export default function App() {
 
 function Dashboard({
   analysis,
+  onAnalysisUpdate,
   section,
   setSection,
   onBack,
@@ -206,6 +209,7 @@ function Dashboard({
   setSeverityFilter,
 }: {
   analysis: AnalysisResult;
+  onAnalysisUpdate: (update: Partial<AnalysisResult>) => void;
   section: Section;
   setSection: (section: Section) => void;
   onBack: () => void;
@@ -255,7 +259,7 @@ function Dashboard({
           {section === "overview" && <Overview analysis={analysis} statCards={statCards} setSection={setSection} setSelectedFinding={setSelectedFinding} aiByFinding={aiByFinding} />}
           {section === "findings" && <FindingsView findings={filteredFindings} allCount={analysis.findings.length} query={query} setQuery={setQuery} severityFilter={severityFilter} setSeverityFilter={setSeverityFilter} selectedFinding={selectedFinding} setSelectedFinding={setSelectedFinding} aiByFinding={aiByFinding} />}
           {section === "architecture" && <ArchitectureView analysis={analysis} />}
-          {section === "ai" && <AiView analysis={analysis} />}
+          {section === "ai" && <AiView analysis={analysis} onAnalysisUpdate={onAnalysisUpdate} />}
         </div>
       </main>
     </div>
@@ -345,18 +349,26 @@ function ArchitectureView({ analysis }: { analysis: AnalysisResult }) {
     <div className="architecture-page">
       <section className="panel"><PanelHeader eyebrow="INFERRED FROM DIRECTORIES + IMPORTS" title="Candidate components" /><p className="panel-copy">The structure below is inferred from file paths and local import edges. It may not match the architecture intended by the project authors.</p><div className="architecture-components">{analysis.architecture.components.map((component) => <article className="architecture-component" key={component.name}><div><Layers3 size={17} /><strong>{component.name}</strong><small>{component.files.length} source files</small></div><ul>{component.files.slice(0, 8).map((path) => <li key={path}><FileCode2 size={13} />{path}</li>)}</ul>{component.files.length > 8 && <small className="more-files">and {component.files.length - 8} more</small>}</article>)}</div></section>
       <section className="panel"><PanelHeader eyebrow="LOCAL IMPORTS" title="Component relationships" /><div className="relationship-list">{analysis.architecture.relationships.length ? analysis.architecture.relationships.map((edge) => <div className="relationship" key={`${edge.source}:${edge.target}`}><span>{edge.source}</span><ArrowUpRight size={14} /><span>{edge.target}</span><small>{edge.file_dependency_count} file edge{edge.file_dependency_count === 1 ? "" : "s"}</small></div>) : <EmptyState icon={<GitBranch size={18} />} title="No cross-component edges" body="Imports found did not cross top-level directory groups." />}</div></section>
-      <section className="panel"><PanelHeader eyebrow="GENERATED FROM THE SAME GRAPH" title="Mermaid diagram" /><pre className="mermaid-source">{analysis.architecture.mermaid}</pre><p className="panel-footnote">This is Mermaid source generated from the analyzed dependency graph.</p></section>
+      <section className="panel"><PanelHeader eyebrow="GENERATED FROM THE SAME GRAPH" title="Mermaid diagram" /><div className="architecture-svg" dangerouslySetInnerHTML={{ __html: analysis.architecture.svg }} /><details className="diagram-source"><summary>View Mermaid source</summary><pre className="mermaid-source">{analysis.architecture.mermaid}</pre></details><p className="panel-footnote">Deterministic diagram from analyzed imports. Amber nodes/edges indicate detected cycles.</p></section>
       <section className="panel"><PanelHeader eyebrow="CYCLE CHECK" title="Dependency cycles" />{analysis.dependency_graph.cycles.length ? analysis.dependency_graph.cycles.map((cycle, index) => <div className="cycle-row" key={`${index}:${cycle.join(":")}`}><AlertTriangle size={15} /><span>{cycle.join(" ↔ ")}</span></div>) : <div className="success-inline"><CircleCheck size={16} /> No import cycles detected among resolved local files.</div>}</section>
     </div>
   );
 }
 
-function AiView({ analysis }: { analysis: AnalysisResult }) {
+function AiView({ analysis, onAnalysisUpdate }: { analysis: AnalysisResult; onAnalysisUpdate: (update: Partial<AnalysisResult>) => void }) {
   const review = analysis.ai_review;
+  const [reviewLoading, setReviewLoading] = useState(false);
+  const [reviewError, setReviewError] = useState<string | null>(null);
   const findingsById = new Map(analysis.findings.map((finding) => [finding.id, finding]));
+  async function runReview() {
+    setReviewLoading(true); setReviewError(null);
+    try { onAnalysisUpdate({ ai_review: await triggerAiReview(analysis.analysis_id) }); }
+    catch (error) { setReviewError(error instanceof Error ? error.message : "Gemini review failed."); }
+    finally { setReviewLoading(false); }
+  }
   return (
     <div className="ai-page">
-      <section className="ai-status-card"><div className="ai-status-icon"><Sparkles size={21} /></div><div><div className="panel-eyebrow">OPTIONAL AI INTERPRETATION · {review.status.toUpperCase()}</div><h2>{review.summary || "Deterministic review remains available"}</h2><p>{review.message}</p></div><span className={`ai-status-pill ${review.status === "complete" ? "ready" : "muted"}`}>{review.status === "complete" ? <Check size={13} /> : <Clock3 size={13} />}{review.status.replace(/_/g, " ")}</span></section>
+      <section className="ai-status-card"><div className="ai-status-icon"><Sparkles size={21} /></div><div><div className="panel-eyebrow">OPTIONAL AI INTERPRETATION · {review.status.toUpperCase()}</div><h2>{review.summary || "Deterministic review remains available"}</h2><p>{review.message}</p>{reviewError && <p role="alert">{reviewError}</p>}</div><span className={`ai-status-pill ${review.status === "completed" ? "ready" : "muted"}`}>{review.status === "completed" ? <Check size={13} /> : <Clock3 size={13} />}{review.status.replace(/_/g, " ")}</span><button type="button" className="outline-button" onClick={runReview} disabled={reviewLoading}>{reviewLoading ? <><Loader2 className="spin" size={14} /> Reviewing…</> : "Run AI review"}</button></section>
       {review.architecture_summary && <section className="panel"><PanelHeader eyebrow="ARCHITECTURE CONTEXT" title="AI summary" /><p className="ai-prose">{review.architecture_summary}</p></section>}
       <section className="panel"><PanelHeader eyebrow="EVIDENCE-LINKED" title="Finding explanations" />{review.findings.length ? <div className="ai-explanations">{review.findings.map((item) => { const finding = findingsById.get(item.finding_id); return <article className="ai-explanation" key={item.finding_id}><div className="ai-explanation-heading"><Sparkles size={15} /><div><strong>{finding?.type ?? item.finding_id}</strong><small>{finding ? `${finding.file}:${finding.line ?? "—"}` : "Finding reference"}</small></div></div><p>{item.explanation}</p><div className="impact-recommendation"><div><small>ARCHITECTURAL IMPACT</small><p>{item.architectural_impact}</p></div><div><small>RECOMMENDATION</small><p>{item.recommendation}</p></div></div></article>; })}</div> : <EmptyState icon={<Bot size={18} />} title="No AI explanations returned" body="Configure the single supported provider to add contextual explanations. Static findings do not depend on AI." />}</section>
       <section className="panel"><PanelHeader eyebrow="SUGGESTED NEXT STEPS" title="Overall recommendations" />{review.overall_recommendations.length ? <ol className="recommendation-list">{review.overall_recommendations.map((item, index) => <li key={`${index}:${item}`}><span>{String(index + 1).padStart(2, "0")}</span>{item}</li>)}</ol> : <p className="panel-copy">Recommendations will appear when a valid AI review is available.</p>}</section>
