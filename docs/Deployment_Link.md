@@ -4,55 +4,55 @@
 
 ## Application URL
 
-**Live deployment URL:** `Not provided yet`
+**Live Application:** https://ai-architecture-reviewer.vercel.app/
 
-Add the actual public frontend URL here after deployment.
+The AI Architecture Reviewer is deployed and accessible through the live Vercel application above.
 
-Example:
+## Deployment Platform
 
-``` text
-https://<your-frontend-domain>
-```
+**Frontend:** Vercel
 
-## Backend API URL
+**Live URL:** https://ai-architecture-reviewer.vercel.app/
 
-**Backend API URL:** `Not provided yet`
+## Application Overview
 
-Example:
+The deployed application provides:
 
-``` text
-https://<your-backend-domain>
-```
+- Python repository analysis
+- ZIP repository upload
+- Public GitHub repository analysis
+- Static code analysis
+- Code smell detection
+- Dependency analysis
+- Inferred architecture visualization
+- SOLID analysis
+- Security and performance heuristics
+- Gemini AI-assisted review
+- Analysis performance metrics
+- Generated analysis reports
 
-## Deployment Configuration
+## Environment Configuration
 
-The deployed application consists of:
+Sensitive configuration is supplied through deployment environment variables.
 
--   React + Vite frontend
--   FastAPI backend
--   Python static-analysis engine
--   Gemini AI review integration
-
-### Backend Environment Variables
-
-``` text
+```text
 GEMINI_API_KEY=<configured-secret>
 GEMINI_MODEL=<configured-model>
 ```
 
-Do not place the real Gemini API key in this file or commit it to Git.
+The actual API key must never be included in this documentation or committed to the repository.
 
 ## Pre-Submission Checklist
 
--   [ ] Frontend is publicly accessible
--   [ ] Backend API is publicly accessible
--   [ ] Frontend points to the production backend
--   [ ] Gemini secret is configured securely
--   [ ] `.env` is not committed
--   [ ] ZIP upload works
--   [ ] Public GitHub analysis works
--   [ ] Findings page works
--   [ ] Architecture page works
--   [ ] AI Review works when Gemini is configured
--   [ ] Performance metrics are displayed
--   [ ] Error handling works
+- [x] Frontend is publicly accessible
+- [x] Live application URL is available
+- [ ] Backend API production URL documented separately
+- [ ] Gemini API key configured securely
+- [ ] `.env` excluded from source control
+- [ ] ZIP upload tested
+- [ ] Public GitHub analysis tested
+- [ ] Findings page tested
+- [ ] Architecture page tested
+- [ ] AI Review tested
+- [ ] Performance metrics tested
+- [ ] Error handling tested
