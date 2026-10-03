@@ -17,6 +17,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import analysis, health, ingestion
+from app.analyzer.evaluation import print_evaluation
 from app.api.ingestion import get_analysis_service, get_ingestion_service
 from app.core.config import get_settings
 from app.core.logging import configure_logging, get_logger
@@ -30,6 +31,7 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    print_evaluation()
     logger.info(
         "startup app_env=%s gemini_configured=%s ai_enabled=%s",
         settings.app_env,

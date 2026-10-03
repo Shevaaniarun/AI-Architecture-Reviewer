@@ -43,27 +43,32 @@ class AnalysisService:
         repository_root: Path,
         settings: Settings,
     ) -> dict[str, Any]:
-        # tracemalloc is process-global; serialize only this measurement window.
+        # tracemalloc is process-global; serialize and isolate this measurement window.
         with _PROFILE_LOCK:
             was_tracing = tracemalloc.is_tracing()
             if not was_tracing:
                 tracemalloc.start()
+            else:
+                tracemalloc.reset_peak()
+
             started = time.perf_counter()
             try:
                 result = self._analyze(ingestion, repository_root, settings)
+            finally:
                 elapsed = time.perf_counter() - started
                 _, peak_bytes = tracemalloc.get_traced_memory()
-            finally:
                 if not was_tracing:
                     tracemalloc.stop()
+
         performance = result["performance"]
         performance["timings"]["total_static_analysis_seconds"] = elapsed
         performance["throughput"] = _throughput(result, elapsed)
+        performance["execution_metrics"] = _execution_metrics(ingestion, result, elapsed)
         performance["python_heap_peak_mb"] = round(peak_bytes / (1024 * 1024), 2)
         performance["memory_measurement"] = (
-            "tracemalloc peak of Python allocations; tracing was already active before this analysis"
+            "tracemalloc peak reset for this static analysis window; tracing was globally active"
             if was_tracing
-            else "tracemalloc peak during this static analysis of Python allocations; not process RSS"
+            else "tracemalloc peak during static analysis window"
         )
         self._print_performance(ingestion, result)
         with self._lock:
@@ -78,24 +83,35 @@ class AnalysisService:
         settings: Settings,
     ) -> dict[str, Any]:
         timings: dict[str, float] = {}
+        
         stage_started = time.perf_counter()
         parsed_files = PythonAstParser().parse_directory(repository_root)
         timings["ast_parsing_seconds"] = time.perf_counter() - stage_started
+        
         stage_started = time.perf_counter()
         metrics = calculate_metrics(parsed_files)
         timings["metric_calculation_seconds"] = time.perf_counter() - stage_started
+        
         stage_started = time.perf_counter()
         graph = build_dependency_graph(parsed_files)
         timings["dependency_graph_seconds"] = time.perf_counter() - stage_started
+        
         thresholds = thresholds_from_settings(settings)
         stage_started = time.perf_counter()
+        smell_findings = detect_smells(parsed_files, metrics, graph, thresholds)
+        timings["code_smell_detection_seconds"] = time.perf_counter() - stage_started
+        
+        stage_started = time.perf_counter()
+        solid_findings = analyze_solid(
+            parsed_files,
+            graph,
+            wide_interface_methods=settings.wide_interface_methods,
+        )
+        timings["solid_analysis_seconds"] = time.perf_counter() - stage_started
+        
         findings = [
-            *detect_smells(parsed_files, metrics, graph, thresholds),
-            *analyze_solid(
-                parsed_files,
-                graph,
-                wide_interface_methods=settings.wide_interface_methods,
-            ),
+            *smell_findings,
+            *solid_findings,
             *analyze_security(parsed_files),
             *analyze_performance(
                 parsed_files,
@@ -105,9 +121,11 @@ class AnalysisService:
         ]
         findings.sort(key=lambda item: (item.file.casefold(), item.line or 0, item.type))
         timings["finding_detection_seconds"] = time.perf_counter() - stage_started
+        
         stage_started = time.perf_counter()
         architecture = infer_architecture(graph)
         timings["architecture_recovery_seconds"] = time.perf_counter() - stage_started
+        
         finding_results = [
             {
                 **asdict(finding),
@@ -171,43 +189,38 @@ class AnalysisService:
 
     @staticmethod
     def _print_performance(ingestion: IngestionResult, result: dict[str, Any]) -> None:
-        metrics = result["metrics"]
-        dependencies = result["dependency_graph"]["dependency_count"]
-        findings = result["findings"]
-        perf = result["performance"]
-        timings = perf["timings"]
-        throughput = perf["throughput"]
+        timings = result["performance"]["timings"]
+        execution = result["performance"]["execution_metrics"]
+        ingestion_keys = ("archive_download_seconds", "upload_staging_seconds", "archive_extraction_seconds")
+        ingestion_duration = sum(ingestion.timings.get(key, 0.0) for key in ingestion_keys)
+        ingestion_label = f"{ingestion_duration:.3f} sec" if any(key in ingestion.timings for key in ingestion_keys) else "N/A"
         rows = [
             "",
-            "=" * 58,
-            "AI ARCHITECTURE REVIEWER — PERFORMANCE",
-            "=" * 58,
-            f"Repository: {ingestion.repository_name}",
-            f"Archive bytes: {ingestion.archive_size_bytes:,}",
-            f"Python files: {metrics['files']:,} | LOC: {metrics['lines_of_code']:,} | Classes: {metrics['classes']:,}",
-            f"Functions: {metrics['functions']:,} | Methods: {metrics['methods']:,} | Dependencies: {dependencies:,} | Findings: {len(findings):,}",
-            "-" * 58,
-            "TIMING (seconds)",
+            "=" * 68,
+            "AI ARCHITECTURE REVIEWER — ANALYSIS PERFORMANCE",
+            "=" * 68,
+            f"Repository:\n{ingestion.repository_name}",
+            f"\nFiles processed:\n{execution['files_processed']}",
+            f"\nPython files:\n{execution['python_files']}",
+            f"\nLines of code:\n{execution['lines_of_code']}",
+            f"\nTotal execution time:\n{execution['total_execution_seconds']:.3f} seconds",
+            f"\nFiles / second:\n{execution['files_per_second']}",
+            f"\nTime / file:\n{execution['seconds_per_file']}",
+            f"\nLOC / second:\n{execution['loc_per_second']}",
+            f"\nTime / 1,000 LOC:\n{execution['seconds_per_1000_loc']}",
+            "\nPIPELINE TIMINGS",
+            f"Repository ingestion: {ingestion_label}",
+            f"AST parsing: {timings['ast_parsing_seconds']:.3f} sec",
+            f"Metrics: {timings['metric_calculation_seconds']:.3f} sec",
+            f"Dependency graph: {timings['dependency_graph_seconds']:.3f} sec",
+            f"Code smell detection: {timings['code_smell_detection_seconds']:.3f} sec",
+            f"SOLID analysis: {timings['solid_analysis_seconds']:.3f} sec",
+            "Design-pattern analysis: N/A (stage is not implemented)",
+            f"Architecture inference: {timings['architecture_recovery_seconds']:.3f} sec",
+            f"Total static analysis: {timings['total_static_analysis_seconds']:.3f} sec",
+            "=" * 68,
+            "",
         ]
-        for key in (
-            "archive_download_seconds", "upload_staging_seconds", "archive_extraction_seconds",
-            "ast_parsing_seconds", "metric_calculation_seconds", "dependency_graph_seconds",
-            "finding_detection_seconds", "architecture_recovery_seconds", "total_static_analysis_seconds",
-        ):
-            if key in timings:
-                rows.append(f"{key.replace('_seconds', '').replace('_', ' ').title()}: {timings[key]:.3f}")
-        rows.extend(
-            [
-                "-" * 58,
-                "THROUGHPUT",
-                f"Python files/sec: {throughput['python_files_per_second']:.2f} | LOC/sec: {throughput['lines_of_code_per_second']:.2f} | Findings/sec: {throughput['findings_per_second']:.2f}",
-                f"Python traced heap peak: {perf['python_heap_peak_mb']:.2f} MB (not process RSS)",
-                f"Gemini configured: {'YES' if result['ai_review']['status'] not in {'not_configured', 'disabled'} else 'NO'}",
-                f"Gemini review time: {result['ai_review'].get('duration_seconds', 0.0):.3f}s | tokens in/out: {result['ai_review'].get('input_tokens')}/{result['ai_review'].get('output_tokens')}",
-                "=" * 58,
-                "",
-            ]
-        )
         print("\n".join(rows), flush=True)
 
     def trigger_ai_review(self, analysis_id: str, settings: Settings) -> dict[str, Any] | None:
@@ -355,4 +368,22 @@ def _throughput(result: dict[str, Any], elapsed_seconds: float) -> dict[str, flo
         "python_files_per_second": round(metrics["files"] / duration, 2),
         "lines_of_code_per_second": round(metrics["lines_of_code"] / duration, 2),
         "findings_per_second": round(len(result["findings"]) / duration, 2),
+    }
+
+
+def _execution_metrics(ingestion: IngestionResult, result: dict[str, Any], elapsed: float) -> dict[str, Any]:
+    files = ingestion.files
+    python_files = result["repository"]["python_files"]
+    loc = result["metrics"]["lines_of_code"]
+    duration = max(elapsed, 1e-12)
+    
+    return {
+        "files_processed": files,
+        "python_files": python_files,
+        "lines_of_code": loc,
+        "total_execution_seconds": round(elapsed, 6),
+        "files_per_second": round(files / duration, 2),
+        "seconds_per_file": round(elapsed / files, 6) if files > 0 else "N/A",
+        "loc_per_second": round(loc / duration, 2),
+        "seconds_per_1000_loc": round((elapsed * 1000) / loc, 6) if loc > 0 else "N/A",
     }
